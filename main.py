@@ -47,11 +47,12 @@ from tkinter.scrolledtext import ScrolledText
 
 from config_io import load_config, save_config
 from csv_import import import_list, TaskRecord
+from upload_history import load_uploaded_barcodes, match_tasks
 from ui_theme import PALETTE as C, FONTS, STATUS_COLORS, apply_theme
 import updater
 
 APP_TITLE = "洗衣管家 · 照片批量上传助手"
-VERSION = "1.11"
+VERSION = "1.12"
 
 _NO_WINDOW = 0x08000000  # subprocess.CREATE_NO_WINDOW
 
@@ -68,6 +69,7 @@ COLOR_OK = STATUS_COLORS["成功"]
 COLOR_FAIL = STATUS_COLORS["失败"]
 COLOR_SKIP = STATUS_COLORS["跳过"]
 COLOR_RUN = STATUS_COLORS["进行中"]
+COLOR_UPLOADED = STATUS_COLORS["已上传"]
 
 
 class MonitorWindow(tk.Toplevel):
@@ -437,6 +439,7 @@ class App(tk.Tk):
         self.tree.tag_configure("fail", foreground=COLOR_FAIL)
         self.tree.tag_configure("skip", foreground=COLOR_SKIP)
         self.tree.tag_configure("running", foreground=COLOR_RUN)
+        self.tree.tag_configure("uploaded", foreground=COLOR_UPLOADED)
         self.tree.tag_configure("stripe", background=C["stripe"])
         self.tree.bind("<Double-1>", self.on_row_dblclick)
         self.tree.bind("<Button-3>", self.on_row_dblclick)
@@ -573,7 +576,8 @@ class App(tk.Tk):
     def _update_row(self, task):
         iid = str(task.index)
         if self.tree.exists(iid):
-            tag = {"成功": "ok", "失败": "fail", "跳过": "skip", "进行中": "running"}.get(task.status, "")
+            tag = {"成功": "ok", "失败": "fail", "跳过": "skip", "进行中": "running",
+                   "已上传": "uploaded"}.get(task.status, "")
             tags = ("stripe",) if task.index % 2 == 0 else ()
             if tag:
                 tags = tags + (tag,)
@@ -870,6 +874,19 @@ class App(tk.Tk):
             self.log(f"  · {issue}")
         if len(report.issues) > 20:
             self.log(f"  · ……其余 {len(report.issues) - 20} 条提示省略")
+        # 历史比对：与上次上传日志对比，成功过的条码直接标记「已上传」
+        try:
+            hist, nfiles = load_uploaded_barcodes(self.result_dir)
+            if hist:
+                matched = match_tasks(self.tasks, hist)
+                if matched:
+                    self._fill_tree()
+                    self.log(f"历史比对：在 {nfiles} 份历史结果中匹配到 {matched} 条已上传条码，"
+                             f"已标记「已上传」（本次执行将跳过这些条码，无需再次过系统对比）。")
+                    report.issues.append(f"历史比对：{matched} 条已上传（自动标记，不重复执行）")
+                    self.status.set(report.summary() + f"；已上传 {matched}")
+        except Exception as e:
+            self.log(f"[警告] 历史比对失败（不影响导入）：{e}")
         # 自动保存最近清单路径到配置（方便下次）
         self.cfg.setdefault("recent", {})["last_csv"] = path
         save_config(BASE_DIR, self.cfg)
@@ -878,7 +895,7 @@ class App(tk.Tk):
         for i in self.tree.get_children():
             self.tree.delete(i)
         for t in self.tasks:
-            tag = {"成功": "ok", "失败": "fail", "跳过": "skip"}.get(t.status, "")
+            tag = {"成功": "ok", "失败": "fail", "跳过": "skip", "已上传": "uploaded"}.get(t.status, "")
             tags = ("stripe",) if t.index % 2 == 0 else ()
             if tag:
                 tags = tags + (tag,)
@@ -1132,7 +1149,7 @@ class App(tk.Tk):
             messagebox.showinfo("导出完成", "已导出：\n" + "\n".join(paths))
 
     def _export_results(self, auto=False):
-        done = [t for t in self.tasks if t.status in ("成功", "失败", "跳过")]
+        done = [t for t in self.tasks if t.status in ("成功", "失败", "跳过", "已上传")]
         if not done:
             if not auto:
                 messagebox.showinfo("提示", "还没有可导出的执行结果。")
