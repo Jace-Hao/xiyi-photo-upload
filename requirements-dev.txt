@@ -1,0 +1,10 @@
+# -*- coding: utf-8 -*-
+# 开发/回归测试依赖（程序正常运行不需要本文件）
+#
+#   py -3 -m pip install -r requirements-dev.txt
+#   python -m pytest tests -q
+#
+# 测试只依赖零第三方依赖模块：result_state.py / upload_history.py / csv_import.py，
+# 不会 import main.py / automation.py，因此不需要 tkinter、pyautogui、win32、
+# websocket-client，也不需要真实 GUI、Win32 窗口或 9222 调试端口。
+pytest>=7.0

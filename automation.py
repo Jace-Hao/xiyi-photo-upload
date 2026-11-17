@@ -24,10 +24,18 @@ automation.py — 自动化执行引擎
 import os
 import time
 import threading
+import traceback
 
 import pyautogui
 
 from winmatch import pick_best_title, pick_best_window
+
+# 三态结果种类 / 状态映射 / 统计累计的唯一实现放在零依赖模块 result_state，
+# 便于在纯净环境独立回归测试；此处保留同名再导出，所有调用点无需改动。
+from result_state import (
+    RESULT_OK, RESULT_SKIP, RESULT_FAIL, STATUS_DRY,
+    status_for, accumulate_stats, new_run_stats,
+)
 
 try:
     from cdp_control import CDPApp
@@ -60,7 +68,6 @@ pyautogui.PAUSE = 0.03
 # 页面识别（根据「页面标志」锚点判断当前在哪一页）
 # ----------------------------------------------------------------------------
 PAGE_NAMES = {"home": "首页", "more": "更多功能页", "photo": "拍照页"}
-
 
 def _anchor_path(cfg, base_dir, name):
     p = (cfg.get("anchors") or {}).get(name) or ""
@@ -686,13 +693,17 @@ class AutomationEngine:
 
     # ---------------- 单条执行 ----------------
     def run_one(self, task):
-        """执行一条记录，返回 (success: bool, message: str)。"""
+        """执行一条记录，返回 (kind, message)。
+
+        kind 为 RESULT_OK / RESULT_SKIP / RESULT_FAIL 三态之一；由 run_batch
+        统一映射成界面状态，避免把「跳过」误记为「成功」。
+        """
         t0 = time.time()
         try:
             if self.cdp is not None:
-                ok, msg = self._run_one_cdp(task)
+                kind, msg = self._run_one_cdp(task)
                 task.duration = time.time() - t0
-                return ok, msg
+                return kind, msg
             self.activate_window()
             self.step_enter_barcode(task.barcode)          # 点击输入框+输入条码+回车
             state = self.step_ensure_ready()               # 首页/更多/拍照 判断
@@ -700,7 +711,7 @@ class AutomationEngine:
             self.step_upload_folder(task.folder)           # 路径→全选→回车
             used = time.time() - t0
             task.duration = used
-            return True, f"完成（{state}，耗时 {used:.1f}s）"
+            return RESULT_OK, f"完成（{state}，耗时 {used:.1f}s）"
         except StepError as e:
             task.duration = time.time() - t0
             if self.cfg["options"].get("screenshot_on_error", True):
@@ -708,13 +719,16 @@ class AutomationEngine:
                 tail = f"，已截图：{p}" if p else ""
             else:
                 tail = ""
-            return False, f"{e}{tail}"
+            return RESULT_FAIL, f"{e}{tail}"
         except pyautogui.FailSafeException:
             self.ctrl.stop()
-            return False, ("触发急停：鼠标/点击坐标落到了屏幕左上角。"
-                           "请把鼠标移离屏幕左上角，并检查坐标校准后重试。")
+            task.duration = time.time() - t0
+            return RESULT_FAIL, ("触发急停：鼠标/点击坐标落到了屏幕左上角。"
+                                 "请把鼠标移离屏幕左上角，并检查坐标校准后重试。")
         except Exception as e:
-            return False, f"异常：{type(e).__name__}: {e}"
+            task.duration = time.time() - t0
+            self.log(traceback.format_exc())
+            return RESULT_FAIL, f"异常：{type(e).__name__}: {e}"
 
     # ---------------- 调试端口（精准）模式 ----------------
     def init_cdp(self):
@@ -1188,9 +1202,25 @@ class AutomationEngine:
         return None
 
     def _run_one_cdp(self, task):
-        """通过调试协议执行一条记录（精准模式）；演练时执行完整“预检查”。"""
+        """通过调试协议执行一条记录（精准模式）。
+
+        演练模式必须在第一次 cdp.page() 之前返回：只做本地离线只读预检
+        （统计文件夹内图片数），不连接软件、不触发条码查询、不修改洗衣管家
+        任何状态。返回 RESULT_SKIP，由 run_batch 统一写成「演练」状态。
+        """
+        # —— 演练：离线只读预检（不碰 cdp，避免任何真实副作用）——
+        if self._dry():
+            if not os.path.isdir(task.folder):
+                return RESULT_SKIP, (
+                    f"检查：文件夹不存在或不可读：{task.folder}"
+                    "（演练未连接软件、未查询；正式执行会判为失败）")
+            files = self._collect_folder_files(task.folder)
+            if not files:
+                return RESULT_SKIP, (
+                    "检查：本地文件夹内没有图片（演练未连接软件、未查询；"
+                    "正式执行会判为失败）")
+            return RESULT_SKIP, f"检查：本地 {len(files)} 张图片（演练未连接软件、未查询）"
         cdp = self.cdp
-        dry = self._dry()
         skip_if_exists = bool(self.cfg["options"].get("skip_if_has_photos", True))
         page = cdp.page()
         self.log(f"    当前页面：{PAGE_NAMES.get(page, '未知') if page else '未知'}")
@@ -1209,22 +1239,14 @@ class AutomationEngine:
         existing = cdp.stable_uploaded_photo_count(timeout=6)   # 两次读数一致才采用
         self.log(f"    订单已加载（已有 {existing} 张照片）")
         files = self._collect_folder_files(task.folder)
-        if dry:
-            if not files:
-                return True, "检查：本地文件夹内没有图片（正式执行将跳过）"
-            if existing > 0 and skip_if_exists:
-                if existing >= len(files):
-                    return True, f"检查：订单已有 {existing} 张照片（正式执行将跳过）"
-                return True, (f"检查：订单已有 {existing} 张、本地 {len(files)} 张"
-                              "（疑似未传完；正式执行仍会跳过，请人工核对）")
-            return True, f"检查：将上传 {len(files)} 张（当前订单已有 {existing} 张）"
         if not files:
             raise StepError(f"文件夹内没有图片文件：{task.folder}")
         if existing > 0 and skip_if_exists:
+            # 这两处「未行动」不能算成功，否则写入历史后该订单会被永久跳过。
             if existing >= len(files):
-                return True, f"跳过：订单已有 {existing} 张照片，未重复上传"
-            return True, (f"跳过：订单已有 {existing} 张、本地 {len(files)} 张，"
-                          "疑似未传完未行动，请人工核对")
+                return RESULT_SKIP, f"跳过：订单已有 {existing} 张照片，未重复上传"
+            return RESULT_SKIP, (f"跳过：订单已有 {existing} 张、本地 {len(files)} 张，"
+                                 "疑似未传完未行动，请人工核对")
         # —— 打开「选择图片」文件对话框 → 选择文件 → 等待上传 ——
         # 注 1：文件名框有长度上限（实测约 259 字符），超长会截断，故按长度分批；
         # 注 2：上传阶段自动把洗衣管家置前+置顶（避免软件在后台时对话框交互失灵），结束后还原。
@@ -1278,7 +1300,7 @@ class AutomationEngine:
                 done_cnt += len(chunk)
                 self.log(f"    本批完成：{info2}")
                 time.sleep(1.2)
-            return True, f"完成（精准模式，{len(files)} 张）"
+            return RESULT_OK, f"完成（精准模式，{len(files)} 张）"
         finally:
             if use_topmost:
                 if self._app_set_topmost(False):
@@ -1290,13 +1312,13 @@ class AutomationEngine:
         批量执行。on_row_start(task) / on_row_done(task, success, message) 可选回调。
         返回统计 dict。
         """
-        stats = {"total": 0, "ok": 0, "fail": 0, "skip": 0}
+        stats = new_run_stats()
         todo = [t for t in tasks if t.status == "待执行"]
         if only_first:
             todo = todo[:1]
         stats["total"] = len(todo)
         if self._dry():
-            self.log("===== 演练模式：不点击 / 不输入，不会真实执行 =====")
+            self.log("===== 演练模式：只读预检，不连接/不修改洗衣管家状态 =====")
         self.log(f"—— 开始执行，共 {len(todo)} 条 ——")
         # 优先尝试「调试端口精准模式」
         self.init_cdp()
@@ -1316,28 +1338,25 @@ class AutomationEngine:
                 self.log("—— 已停止（剩余任务未执行）——")
                 break
             self.ctrl.wait_if_paused()
-            if task.status == "跳过":
-                stats["skip"] += 1
-                continue
             self.log(f"[{i}/{len(todo)}] 条码 {task.barcode} 开始…")
             if on_row_start:
                 on_row_start(task)
-            success, msg = self.run_one(task)
-            task.status = "成功" if success else "失败"
-            if self._dry():
+            kind, msg = self.run_one(task)
+            dry = self._dry()
+            # 演练批次统一写「演练」，无论结果种类，绝不污染历史去重集合。
+            task.status = status_for(kind, dry)
+            if dry:
                 msg = "[演练] " + msg
             task.note = msg
-            if success:
-                stats["ok"] += 1
-                self.log(f"[{i}/{len(todo)}] 条码 {task.barcode} ✔ {msg}")
-            else:
-                stats["fail"] += 1
-                self.log(f"[{i}/{len(todo)}] 条码 {task.barcode} ✘ {msg}")
-                if self.cfg["options"].get("stop_on_error", False):
-                    if on_row_done:
-                        on_row_done(task, success, msg)
-                    self.log("—— 已按“出错即暂停”设置中止，可修正后继续 ——")
-                    break
+            accumulate_stats(stats, kind, dry)
+            success = (kind == RESULT_OK)   # 对外回调保持 bool 语义
+            mark = {RESULT_OK: "✔", RESULT_SKIP: "○", RESULT_FAIL: "✘"}.get(kind, "✘")
+            self.log(f"[{i}/{len(todo)}] 条码 {task.barcode} {mark} [{task.status}] {msg}")
+            if kind == RESULT_FAIL and self.cfg["options"].get("stop_on_error", False):
+                if on_row_done:
+                    on_row_done(task, success, msg)
+                self.log("—— 已按“出错即暂停”设置中止，可修正后继续 ——")
+                break
             if on_row_done:
                 on_row_done(task, success, msg)
             self.sleep(self._tf("between_rows", 1.0))
@@ -1347,5 +1366,6 @@ class AutomationEngine:
             except Exception:
                 pass
             self.cdp = None
-        self.log(f"—— 执行结束：成功 {stats['ok']}，失败 {stats['fail']}，跳过 {stats['skip']}，合计 {stats['total']} ——")
+        self.log(f"—— 执行结束：成功 {stats['ok']}，失败 {stats['fail']}，"
+                 f"跳过 {stats['skip']}，演练 {stats['dry']}，合计 {stats['total']} ——")
         return stats

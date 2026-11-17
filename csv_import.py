@@ -59,7 +59,7 @@ class TaskRecord:
     folder: str = ""                # 文件位置（文件夹路径）
     folder_exists: bool = False     # 文件夹是否存在
     file_count: int = 0             # 文件夹内文件数量（不含子目录）
-    status: str = "待执行"           # 待执行 / 进行中 / 成功 / 失败 / 跳过
+    status: str = "待执行"           # 待执行 / 进行中 / 成功 / 失败 / 跳过 / 演练 / 已上传
     note: str = ""                  # 备注（校验问题或执行结果）
     duration: float = 0.0           # 执行耗时（秒）
 

@@ -4,7 +4,7 @@
 
 ## 前置依赖
 
-- Python 3.14（含 `PyInstaller` 6.x、`pywin32`、`websocket-client` 等，见 `../requirements.txt`）
+- Python 3.14（需预装构建期工具 `PyInstaller` 6.x；`../requirements.txt` 列出的是**程序运行时依赖**，其中 `pywin32`、`websocket-client` 等会由 PyInstaller 打包进产物，二者用途不同，不要混为一谈）
 - Inno Setup 6（默认安装到 `C:\Program Files (x86)\Inno Setup 6\`）
   - 中文语言包 `ChineseSimplified.isl` 已随本目录提供，`build_installer.py` 会把它复制到 Inno 的 `Languages\` 目录
   - 语言包来源：<https://github.com/kira-96/Inno-Setup-Chinese-Simplified-Translation>

@@ -3,3 +3,4 @@ __pycache__/
 输出结果/
 运行日志_*.txt
 .openclaw/
+.workbuddy/

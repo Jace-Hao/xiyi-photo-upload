@@ -49,10 +49,11 @@ from config_io import load_config, save_config
 from csv_import import import_list, TaskRecord
 from upload_history import load_uploaded_barcodes, match_tasks
 from ui_theme import PALETTE as C, FONTS, STATUS_COLORS, apply_theme
+from result_state import has_app_target, new_run_stats
 import updater
 
 APP_TITLE = "洗衣管家 · 照片批量上传助手"
-VERSION = "1.12"
+VERSION = "1.13"
 
 _NO_WINDOW = 0x08000000  # subprocess.CREATE_NO_WINDOW
 
@@ -70,6 +71,11 @@ COLOR_FAIL = STATUS_COLORS["失败"]
 COLOR_SKIP = STATUS_COLORS["跳过"]
 COLOR_RUN = STATUS_COLORS["进行中"]
 COLOR_UPLOADED = STATUS_COLORS["已上传"]
+COLOR_DRY = STATUS_COLORS["演练"]
+
+# 终态集合：进度条 / 监视窗统计「已完成」时统一使用，必须与导出状态一致。
+# 含「已上传」是为了让历史任务也计入基线，避免分母与分子口径不一致。
+DONE_STATUSES = ("成功", "失败", "跳过", "演练", "已上传")
 
 
 class MonitorWindow(tk.Toplevel):
@@ -242,11 +248,12 @@ class MonitorWindow(tk.Toplevel):
         self._total = max(int(total), 1)
         self._badge.configure(text="演练模式" if dry else "实时监视")
 
-    def update_counts(self, done, ok, fail, skip):
+    def update_counts(self, done, ok, fail, skip, dry=0):
         pct = min(int(done * 100 / self._total), 100)
         self._bar.configure(value=pct)
+        dry_part = f"    演练 {dry}" if dry else ""
         self._count.configure(
-            text=f"{done}/{self._total}    成功 {ok}    失败 {fail}    跳过 {skip}")
+            text=f"{done}/{self._total}    成功 {ok}    失败 {fail}    跳过 {skip}{dry_part}")
         if self._minimized:
             self._badge.configure(text=f"{done}/{self._total}")
 
@@ -288,6 +295,11 @@ class App(tk.Tk):
         os.makedirs(self.result_dir, exist_ok=True)
         self.run_started_at = None
         self.run_log_file = None
+        # 本次执行快照：进度条 / 监视窗统一以 run_scope 为分母。
+        self.run_scope = 0
+        self.run_done_before = 0
+        self.run_counts_before = {}
+        self.cdp_fallback = False
 
         self._setup_style()
         self._setup_brand()
@@ -440,6 +452,7 @@ class App(tk.Tk):
         self.tree.tag_configure("skip", foreground=COLOR_SKIP)
         self.tree.tag_configure("running", foreground=COLOR_RUN)
         self.tree.tag_configure("uploaded", foreground=COLOR_UPLOADED)
+        self.tree.tag_configure("dry", foreground=COLOR_DRY)
         self.tree.tag_configure("stripe", background=C["stripe"])
         self.tree.bind("<Double-1>", self.on_row_dblclick)
         self.tree.bind("<Button-3>", self.on_row_dblclick)
@@ -503,51 +516,64 @@ class App(tk.Tk):
     def log(self, text):
         self.msg_queue.put(("log", text))
 
+    def _handle_message(self, kind, payload):
+        """统一分派全部队列消息（10 类）。
+
+        _drain_queue（定时轮询）与 _pump_events（长流程中即时刷新）共用本方法，
+        保证两条路径口径一致：非 log 消息不会被丢弃，log 同样同步到监视窗。
+        注意：本方法内不得调用 _pump_events / _drain_queue，避免递归。
+        """
+        if kind == "log":
+            ts = time.strftime("%H:%M:%S")
+            self._append_log(f"[{ts}] {payload}")
+            self._monitor_log(f"[{ts}] {payload}")
+        elif kind == "row":
+            task, success, msg = payload
+            self._update_row(task)
+            self._monitor_sync()
+        elif kind == "row_start":
+            task = payload
+            self._update_row(task)
+            self._monitor_sync(task)
+        elif kind == "progress":
+            self.progress.configure(value=self._run_done_count())
+            self._monitor_sync()
+        elif kind == "done":
+            self._on_run_finished(payload)
+        elif kind == "update_result":
+            self._on_update_result(payload)
+        elif kind == "update_source":
+            i, n, host = payload
+            if i > 1:
+                self.update_accel = True
+                self.log(f"直连较慢，已自动切换国内加速线路：{host}（第 {i - 1}/{n - 1} 条）")
+                self.status.set(f"国内加速下载中（{host}）…")
+            else:
+                self.update_accel = False
+                self.log(f"开始从 GitHub 直连下载：{host}")
+                self.status.set("更新包下载中（GitHub 直连）…")
+        elif kind == "update_progress":
+            latest = (self.update_info or {}).get("latest", "?")
+            tag = "（国内加速）" if self.update_accel else ""
+            if payload is None:
+                self.status.set(f"正在下载 v{latest}{tag} …")
+            else:
+                self.status.set(f"正在下载 v{latest}{tag} … {payload}%")
+        elif kind == "update_file":
+            self._on_update_file(payload)
+        elif kind == "update_error":
+            self._on_update_error(payload)
+
     def _drain_queue(self):
+        """定时轮询消息队列，统一交给 _handle_message 分派。"""
         try:
             while True:
                 kind, payload = self.msg_queue.get_nowait()
-                if kind == "log":
-                    ts = time.strftime("%H:%M:%S")
-                    self._append_log(f"[{ts}] {payload}")
-                    self._monitor_log(f"[{ts}] {payload}")
-                elif kind == "row":
-                    task, success, msg = payload
-                    self._update_row(task)
-                    self._monitor_sync()
-                elif kind == "row_start":
-                    task = payload
-                    self._update_row(task)
-                    self._monitor_sync(task)
-                elif kind == "progress":
-                    done = sum(1 for t in self.tasks if t.status in ("成功", "失败", "跳过"))
-                    self.progress.configure(value=done)
-                    self._monitor_sync()
-                elif kind == "done":
-                    self._on_run_finished(payload)
-                elif kind == "update_result":
-                    self._on_update_result(payload)
-                elif kind == "update_source":
-                    i, n, host = payload
-                    if i > 1:
-                        self.update_accel = True
-                        self.log(f"直连较慢，已自动切换国内加速线路：{host}（第 {i - 1}/{n - 1} 条）")
-                        self.status.set(f"国内加速下载中（{host}）…")
-                    else:
-                        self.update_accel = False
-                        self.log(f"开始从 GitHub 直连下载：{host}")
-                        self.status.set("更新包下载中（GitHub 直连）…")
-                elif kind == "update_progress":
-                    latest = (self.update_info or {}).get("latest", "?")
-                    tag = "（国内加速）" if self.update_accel else ""
-                    if payload is None:
-                        self.status.set(f"正在下载 v{latest}{tag} …")
-                    else:
-                        self.status.set(f"正在下载 v{latest}{tag} … {payload}%")
-                elif kind == "update_file":
-                    self._on_update_file(payload)
-                elif kind == "update_error":
-                    self._on_update_error(payload)
+                try:
+                    self._handle_message(kind, payload)
+                except Exception:
+                    # 单条消息处理失败不能中断轮询，否则队列会永久停摆。
+                    self.log(f"[错误] 处理界面消息失败：{traceback.format_exc()}")
         except queue.Empty:
             pass
         self.after(120, self._drain_queue)
@@ -577,7 +603,7 @@ class App(tk.Tk):
         iid = str(task.index)
         if self.tree.exists(iid):
             tag = {"成功": "ok", "失败": "fail", "跳过": "skip", "进行中": "running",
-                   "已上传": "uploaded"}.get(task.status, "")
+                   "已上传": "uploaded", "演练": "dry"}.get(task.status, "")
             tags = ("stripe",) if task.index % 2 == 0 else ()
             if tag:
                 tags = tags + (tag,)
@@ -587,8 +613,14 @@ class App(tk.Tk):
 
     # ================= 模式化 UI（精准/兼容） =================
     def _apply_mode_ui(self):
-        """精准模式启用时隐藏坐标校准入口；兼容模式下恢复显示。"""
-        cdp_on = bool(self.cfg.get("cdp", {}).get("enabled", True))
+        """精准模式启用时隐藏坐标校准入口；兼容模式下恢复显示。
+
+        cdp_fallback 为真表示本次运行已退回兼容通道：此时即使配置里
+        cdp.enabled=true，也必须显示【坐标校准】入口，否则用户无法完成
+        兼容模式所需的坐标采集。
+        """
+        cdp_on = bool(self.cfg.get("cdp", {}).get("enabled", True)) \
+            and not bool(getattr(self, "cdp_fallback", False))
         try:
             if cdp_on:
                 self.btn_calib.pack_forget()
@@ -607,13 +639,18 @@ class App(tk.Tk):
 
     # ================= 调试模式保障（每次运行前） =================
     def _cdp_port_alive(self):
-        """检查洗衣管家调试端口是否可用。"""
+        """检查洗衣管家调试端口是否可用（且确实属于本应用）。
+
+        归属判定抽成 result_state.has_app_target 纯函数：仅当 /json 里存在
+        type=="page" 且标题含「洗衣管家」或 url 含 xiyijst 的 target 才为真，
+        避免任意 Chromium / CEF 占用该端口时被误判成精准模式已就绪。
+        """
         cdp_cfg = self.cfg.get("cdp", {}) or {}
         port = int(cdp_cfg.get("port", 9222))
         try:
             data = json.load(urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/json", timeout=2))
-            return bool([t for t in data if t.get("type") == "page"])
+            return has_app_target(data)
         except Exception:
             return False
 
@@ -672,18 +709,23 @@ class App(tk.Tk):
                 self._pump_events()
         return False
 
-    def _launch_app_debug(self, exe, app_dir):
-        """以调试参数启动洗衣管家。"""
-        subprocess.Popen([exe, "--remote-debugging-port=9222"], cwd=app_dir)
+    def _launch_app_debug(self, exe, app_dir, port=9222):
+        """以调试参数启动洗衣管家；端口必须与 config.json → cdp.port 一致。"""
+        subprocess.Popen([exe, f"--remote-debugging-port={int(port)}"], cwd=app_dir)
 
     def _pump_events(self):
-        """立即把日志刷到界面（避免长流程时“看起来卡死”）。"""
+        """立即排空消息队列并刷新界面（避免长流程时“看起来卡死”）。
+
+        与 _drain_queue 共用 _handle_message：log 之外 9 类消息不再被丢弃，
+        log 也会走 _monitor_log，两条路径口径完全一致。
+        """
         try:
             while True:
                 kind, payload = self.msg_queue.get_nowait()
-                if kind == "log":
-                    ts = time.strftime("%H:%M:%S")
-                    self._append_log(f"[{ts}] {payload}")
+                try:
+                    self._handle_message(kind, payload)
+                except Exception:
+                    self.log(f"[错误] 处理界面消息失败：{traceback.format_exc()}")
         except queue.Empty:
             pass
         except Exception:
@@ -790,7 +832,7 @@ class App(tk.Tk):
             try:
                 self.log(f"正在启动洗衣管家（调试模式，第 {attempt} 次）…")
                 self._pump_events()
-                self._launch_app_debug(exe, app_dir)
+                self._launch_app_debug(exe, app_dir, cdp_cfg.get("port", 9222))
             except Exception as e:
                 self.log(f"启动失败（{e}）。")
                 self._pump_events()
@@ -895,7 +937,8 @@ class App(tk.Tk):
         for i in self.tree.get_children():
             self.tree.delete(i)
         for t in self.tasks:
-            tag = {"成功": "ok", "失败": "fail", "跳过": "skip", "已上传": "uploaded"}.get(t.status, "")
+            tag = {"成功": "ok", "失败": "fail", "跳过": "skip", "已上传": "uploaded",
+                   "演练": "dry"}.get(t.status, "")
             tags = ("stripe",) if t.index % 2 == 0 else ()
             if tag:
                 tags = tags + (tag,)
@@ -948,10 +991,19 @@ class App(tk.Tk):
         if not pending:
             messagebox.showinfo("提示", "没有待执行的任务（可能都已执行或跳过）。")
             return False
+        # 每次批次开始前清除上一次的回退状态，恢复配置对应的默认模式 UI；
+        # 本次是否回退由下面 ensure_debug_ready_for_run 的结果重新决定。
+        self.cdp_fallback = False
+        self._apply_mode_ui()
         # 每次运行前：确保洗衣管家处于调试模式（没开则自动带参数启动）
         mode = self.ensure_debug_ready_for_run()
-        if mode == "debug":
-            return True      # 精准模式不需要坐标校准
+        if mode == "fallback":
+            # 精准模式不可用 → 恢复【坐标校准】入口，否则兼容通道所需坐标无法采集。
+            self.cdp_fallback = True
+            self._apply_mode_ui()
+        if mode == "debug" and self.cfg.get("cdp", {}).get("enabled", True):
+            return True      # 精准模式已启用且端口归属校验通过，不需要坐标校准
+        # cdp.enabled=false 时 automation 会关掉 CDP 走兼容通道，必须校验坐标。
         pts = self.cfg["points"]
         missing = [k for k in ("barcode_input", "photo_button", "upload_button")
                    if not pts.get(k)]
@@ -977,9 +1029,10 @@ class App(tk.Tk):
         self._start_worker(only_first=True)
 
     def _start_worker(self, only_first):
-        # 快照待执行任务（重跑时保留已成功记录的历史）
+        # 快照待执行任务（重跑时保留已成功记录的历史）。
+        # 「演练」必须重置，否则演练后无法再正式执行；「跳过」保持导入校验语义不重置。
         for t in self.tasks:
-            if t.status in ("失败", "进行中"):
+            if t.status in ("失败", "进行中", "演练"):
                 t.status = "待执行"
                 t.note = ""
         self._fill_tree()
@@ -1004,14 +1057,21 @@ class App(tk.Tk):
             self.run_log_file = None
 
         self.run_started_at = time.time()
-        total = len([t for t in self.tasks if t.status == "待执行"])
+        # 本次执行快照：进度条与监视窗统一以 run_scope（本次待执行条数）为分母。
+        # run_counts_before 记录执行前各终态数量，完成数 = 当前终态数 - 基线，
+        # 这样历史「已上传 / 成功」记录不会把进度条提前顶满，也不会到不了 100%。
+        scope = len([t for t in self.tasks if t.status == "待执行"])
         if only_first:
-            total = min(total, 1)
-        done_before = sum(1 for t in self.tasks if t.status in ("成功", "失败", "跳过"))
-        self.progress.configure(maximum=max(len(self.tasks), 1), value=done_before)
+            scope = min(scope, 1)
+        self.run_scope = scope
+        self.run_counts_before = {
+            s: sum(1 for t in self.tasks if t.status == s) for s in DONE_STATUSES
+        }
+        self.run_done_before = sum(self.run_counts_before.values())
+        self.progress.configure(maximum=max(scope, 1), value=0)
 
         self._set_running_ui(True)
-        self._monitor_open(total, only_first, bool(self.var_dry_run.get()))
+        self._monitor_open(self.run_scope, bool(self.var_dry_run.get()))
 
         def worker():
             try:
@@ -1025,7 +1085,7 @@ class App(tk.Tk):
             except Exception as e:
                 self.log(f"[错误] 执行线程异常：{e}")
                 self.log(traceback.format_exc())
-                stats = {"total": 0, "ok": 0, "fail": 0, "skip": 0}
+                stats = new_run_stats()
             self.msg_queue.put(("done", stats))
 
         self.worker = threading.Thread(target=worker, daemon=True)
@@ -1066,8 +1126,11 @@ class App(tk.Tk):
             self.log("收到停止指令，正在安全停止…")
 
     # ================= 执行监视悬浮窗 =================
-    def _monitor_open(self, total, only_first, dry):
-        """执行开始：弹出（或重建）置顶监视窗。"""
+    def _monitor_open(self, total, dry):
+        """执行开始：弹出（或重建）置顶监视窗。
+
+        total 为本次执行快照 run_scope，与进度条 maximum 同源。
+        """
         try:
             if self.monitor is not None:
                 try:
@@ -1075,21 +1138,40 @@ class App(tk.Tk):
                 except Exception:
                     pass
             self.monitor = MonitorWindow(self, on_pause=self.on_pause, on_stop=self.on_stop)
-            self.monitor.set_total(min(total, 1) if only_first else total, dry)
+            self.monitor.set_total(total, dry)
             self.monitor.show()
         except Exception as e:
             self.monitor = None
             self.log(f"[警告] 监视窗口创建失败：{e}")
 
+    def _run_counts(self):
+        """本次执行内各终态的增量计数（相对执行开始前的基线）。
+
+        终态集合含「已上传 / 跳过 / 演练」，因此历史记录和演练批次都不会
+        让进度条提前顶满或永远到不了 100%。
+        """
+        before = getattr(self, "run_counts_before", {}) or {}
+        counts = {}
+        for status in DONE_STATUSES:
+            current = sum(1 for t in self.tasks if t.status == status)
+            counts[status] = max(0, current - int(before.get(status, 0) or 0))
+        return counts
+
+    def _run_done_count(self):
+        """本次执行已完成条数（进度条与监视窗共用的唯一口径）。"""
+        return sum(self._run_counts().values())
+
     def _monitor_sync(self, current_task=None):
-        """把最新计数 / 当前条码同步到监视窗。"""
+        """把最新计数 / 当前条码同步到监视窗（分母为本次执行快照 run_scope）。"""
         mon = self.monitor
         if mon is None or mon.closed:
             return
-        ok = sum(1 for t in self.tasks if t.status == "成功")
-        fail = sum(1 for t in self.tasks if t.status == "失败")
-        skip = sum(1 for t in self.tasks if t.status == "跳过")
-        mon.update_counts(ok + fail + skip, ok, fail, skip)
+        counts = self._run_counts()
+        ok = counts["成功"]
+        fail = counts["失败"]
+        skip = counts["跳过"]
+        dry = counts["演练"]
+        mon.update_counts(self._run_done_count(), ok, fail, skip, dry)
         if current_task is not None:
             mon.set_current(f"正在处理：{current_task.barcode}（第 {current_task.index} 条）")
 
@@ -1117,7 +1199,8 @@ class App(tk.Tk):
             return
         try:
             mon.finish(f"执行结束：成功 {stats.get('ok', 0)} / 失败 {stats.get('fail', 0)}"
-                       f" / 跳过 {stats.get('skip', 0)}，用时 {dur:.0f} 秒")
+                       f" / 跳过 {stats.get('skip', 0)} / 演练 {stats.get('dry', 0)}，"
+                       f"用时 {dur:.0f} 秒")
         except Exception:
             pass
 
@@ -1126,7 +1209,8 @@ class App(tk.Tk):
         dur = time.time() - self.run_started_at if self.run_started_at else 0
         prefix = "执行结束（演练模式·未真实操作）：" if self.cfg["options"].get("dry_run") else "执行结束："
         self.status.set(prefix + f"成功 {stats.get('ok', 0)} / 失败 {stats.get('fail', 0)} / "
-                        f"跳过 {stats.get('skip', 0)}，用时 {dur:.0f} 秒")
+                        f"跳过 {stats.get('skip', 0)} / 演练 {stats.get('dry', 0)}，"
+                        f"用时 {dur:.0f} 秒")
         self._monitor_finish(stats, dur)
         # 自动导出结果
         try:
@@ -1149,13 +1233,18 @@ class App(tk.Tk):
             messagebox.showinfo("导出完成", "已导出：\n" + "\n".join(paths))
 
     def _export_results(self, auto=False):
-        done = [t for t in self.tasks if t.status in ("成功", "失败", "跳过", "已上传")]
+        done = [t for t in self.tasks
+                if t.status in ("成功", "失败", "跳过", "演练", "已上传")]
         if not done:
             if not auto:
                 messagebox.showinfo("提示", "还没有可导出的执行结果。")
             return []
         ts = time.strftime("%Y%m%d_%H%M%S")
-        base = os.path.join(self.result_dir, f"执行结果_{ts}")
+        # 演练批次的自动导出改用独立前缀：upload_history 只扫 执行结果_*.csv，
+        # 这样演练记录绝不会被历史比对误认成「已上传」。手动导出不受影响。
+        is_dry_auto = bool(auto and self.cfg["options"].get("dry_run", False))
+        prefix = "演练结果" if is_dry_auto else "执行结果"
+        base = os.path.join(self.result_dir, f"{prefix}_{ts}")
         headers = ["序号", "条码", "文件夹位置", "文件数", "结果", "耗时(秒)", "备注"]
         rows = []
         for t in done:
@@ -1165,6 +1254,7 @@ class App(tk.Tk):
         ok = sum(1 for t in done if t.status == "成功")
         fail = sum(1 for t in done if t.status == "失败")
         skip = sum(1 for t in done if t.status == "跳过")
+        dry = sum(1 for t in done if t.status == "演练")
 
         paths = []
         # --- CSV（utf-8-sig，Excel 直接打开无乱码） ---
@@ -1174,7 +1264,8 @@ class App(tk.Tk):
             w = _csv.writer(f)
             w.writerow([f"# {APP_TITLE} v{VERSION} 执行结果"])
             w.writerow([f"# 导出时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"])
-            w.writerow([f"# 合计：{len(done)} 条，成功 {ok}，失败 {fail}，跳过 {skip}"])
+            w.writerow([f"# 合计：{len(done)} 条，成功 {ok}，失败 {fail}，"
+                        f"跳过 {skip}，演练 {dry}"])
             w.writerow(headers)
             for r in rows:
                 w.writerow(r)
@@ -1202,6 +1293,7 @@ class App(tk.Tk):
                 ws2.append(["成功", ok])
                 ws2.append(["失败", fail])
                 ws2.append(["跳过", skip])
+                ws2.append(["演练", dry])
                 ws2.append(["合计", len(done)])
                 xlsx_path = base + ".xlsx"
                 wb.save(xlsx_path)
